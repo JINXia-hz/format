@@ -17,6 +17,17 @@ declare -A FS_CMDS=(
     ["fat32"]="mkfs.fat -F32"
 )
 
+# 检测用户是否输入 q 退出，若是则生成日志后优雅退出
+check_quit() {
+    local input=$1
+    if [[ "$input" == "q" || "$input" == "Q" ]]; then
+        log_message "INFO" "用户请求退出，生成 Merkle 树日志"
+        generate_merkle_tree_log "$LOG_FILE" "$MERKLE_LOG_FILE"
+        echo "用户请求退出，已生成日志。"
+        exit 0
+    fi
+}
+
 select_type() {
     local prompt=$1
     local fs_choice
@@ -30,7 +41,8 @@ select_type() {
     echo "  5) btrfs" >&2
     echo "  6) ntfs" >&2
     echo "  7) fat32" >&2
-    fs_choice=$(validate_input "请输入编号 (1-7，默认 1): " "^[1-7]$" "1") 
+    fs_choice=$(validate_input "请输入编号 (1-7，默认 1，输入 q 退出): " "^[1-7qQ]$" "1")
+    check_quit "$fs_choice"
     case "${fs_choice:-1}" in
         1) echo "xfs" ;;
         2) echo "ext4" ;;
@@ -53,7 +65,8 @@ echo "=================================================="
 echo "  1) 交互确认模式 - 每个磁盘格式化前询问确认"
 echo "  2) 自动确认模式 - 不询问，直接格式化所有磁盘"
 echo "=================================================="
-confirm_mode=$(validate_input "请输入编号 (1-2，默认 1): " "^[12]$" "1")
+confirm_mode=$(validate_input "请输入编号 (1-2，默认 1，输入 q 退出): " "^[12qQ]$" "1")
+check_quit "$confirm_mode"
 
 echo ""
 echo "=================================================="
@@ -62,7 +75,8 @@ echo "=================================================="
 echo "  1) 统一格式 - 所有磁盘使用同一种文件系统"
 echo "  2) 单次指定 - 每个磁盘单独选择文件系统"
 echo "=================================================="
-fs_mode=$(validate_input "请输入编号 (1-2，默认 1): " "^[12]$" "1")
+fs_mode=$(validate_input "请输入编号 (1-2，默认 1，输入 q 退出): " "^[12qQ]$" "1")
+check_quit "$fs_mode"
 
 # 统一格式模式：提前选择文件系统
 UNIFIED_FS=""
@@ -260,7 +274,8 @@ execute_action() {
             echo "=================================================="
             echo "$(lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE,MODEL /dev/$disk)"
             echo "=================================================="
-            confirm=$(validate_input "确定要格式化 /dev/$disk 为 ${fs_type} 吗？(y/N): " "^[yYnN]$" "n")
+            confirm=$(validate_input "确定要格式化 /dev/$disk 为 ${fs_type} 吗？(y/N)，输入 q 退出: " "^[yYnNqQ]$" "n")
+            check_quit "$confirm"
             if [[ "$confirm" =~ ^[yY]$ ]]; then
                 log_message "INFO" "用户确认格式化磁盘: /dev/${disk}，文件系统: ${fs_type}"
                 format_disk "$disk" "$fs_type"
@@ -294,4 +309,6 @@ for disk in $(lsblk -dno NAME,TYPE | awk '$2=="disk" {print $1}'); do
     execute_action "$disk"
 done
 
+# 脚本正常结束，生成 Merkle 树日志
+generate_merkle_tree_log "$LOG_FILE" "$MERKLE_LOG_FILE"
 log_message "INFO" "脚本执行完毕"
