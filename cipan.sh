@@ -232,4 +232,119 @@ format_disk() {
         disk_size_blocks=$(blockdev --getsz "/dev/$disk" 2>/dev/null || echo 0)
         if [ "$disk_size_blocks" -gt 0 ]; then
             # 计算倒数第 30MB 的位置
-            local seek_pos=$(( disk_size_blocks * 512
+            local seek_pos=$(( disk_size_blocks * 512 / 1048576 - 30 ))
+            if [ "$seek_pos" -gt 0 ]; then
+                dd if=/dev/zero of="/dev/$disk" bs=1M count=30 seek="$seek_pos" status=none 2>/dev/null || true
+            fi
+        fi
+    fi
+    sync
+
+    # 4. 同步内核状态，处理 udev 延迟扫描死锁
+    log_message "INFO" "刷新内核块设备缓冲区并通知 udev: /dev/${disk}"
+    blockdev --flushbufs "/dev/$disk" 2>/dev/null || true
+    
+    if command -v partprobe &>/dev/null; then
+        partprobe "/dev/$disk" 2>/dev/null || true
+    else
+        blockdev --rereadpt "/dev/$disk" 2>/dev/null || true
+    fi
+    
+    if command -v udevadm &>/dev/null; then
+        udevadm settle --timeout=5 2>/dev/null || true
+    fi
+    
+    sleep 2
+    
+    # 5. 最终防线：检查内核是否彻底释放了分区映射
+    local retry_count=0
+    while [ "$(lsblk -nlo NAME "/dev/$disk" 2>/dev/null | wc -l)" -gt 1 ]; do
+        if [ "$retry_count" -ge 5 ]; then
+            log_message "ERROR" "内核仍未释放 /dev/${disk} 的分区映射，格式化中止！"
+            echo "错误：设备处于死锁状态，内核拒绝释放分区节点，无法执行 mkfs。"
+            return 1
+        fi
+        log_message "WARN" "等待内核释放设备节点... ($retry_count/5)"
+        
+        # 尝试使用 kpartx 删除僵尸映射
+        if command -v kpartx &>/dev/null; then
+            kpartx -d "/dev/$disk" 2>/dev/null || true
+        fi
+        
+        if command -v partprobe &>/dev/null; then
+            partprobe "/dev/$disk" 2>/dev/null || true
+        else
+            blockdev --rereadpt "/dev/$disk" 2>/dev/null || true
+        fi
+        
+        sleep 2
+        ((retry_count++))
+    done
+    
+    log_message "INFO" "开始格式化磁盘(${fs_type}): /dev/${disk}"
+    echo "正在格式化为 ${fs_type} 文件系统..."
+    
+    if $cmd "/dev/$disk" 2>&1; then
+        log_message "INFO" "格式化完成: /dev/${disk} (${fs_type})"
+        echo "/dev/$disk 格式化完成 (${fs_type})。"
+        return 0
+    else
+        log_message "ERROR" "格式化失败: /dev/${disk} (${fs_type})"
+        echo "错误：/dev/$disk 格式化失败！"
+        return 1
+    fi
+}
+
+execute_action() {
+    local disk=$1
+    local fs_type
+    
+    if [ "$fs_mode" -eq 1 ]; then
+        fs_type="$UNIFIED_FS"
+    else
+        fs_type=$(select_type "请选择 /dev/${disk} 的文件系统类型:")
+    fi
+    
+    case "$confirm_mode" in
+        1)
+            echo "=================================================="
+            echo "$(lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE,MODEL /dev/$disk)"
+            echo "=================================================="
+            confirm=$(validate_input "确定要格式化 /dev/$disk 为 ${fs_type} 吗？(y/N)，输入 q 退出: " "^[yYnNqQ]$" "n")
+            check_quit "$confirm"
+            if [[ "$confirm" =~ ^[yY]$ ]]; then
+                log_message "INFO" "用户确认格式化磁盘: /dev/${disk}，文件系统: ${fs_type}"
+                format_disk "$disk" "$fs_type"
+            else
+                log_message "INFO" "用户取消格式化磁盘: /dev/${disk}"
+                echo "操作已取消。"
+            fi
+            ;;
+        2)
+            echo "自动格式化 /dev/$disk (${fs_type}) ..."
+            log_message "INFO" "自动模式格式化磁盘: /dev/${disk}，文件系统: ${fs_type}"
+            format_disk "$disk" "$fs_type"
+            ;;
+    esac
+}
+
+for disk in $(lsblk -dno NAME,TYPE | awk '$2=="disk" {print $1}'); do
+    if [ "$disk" == "$SYS_DISK" ] ; then
+        log_message "INFO" "跳过当前运行系统物理盘: /dev/${disk}"
+        continue
+    fi
+    
+    if lsblk -no MOUNTPOINT "/dev/$disk" | grep -E -q "^/+$|^/boot"; then
+        log_message "WARN" "拒绝操作：在 /dev/${disk} 上检测到关键系统挂载点！"
+        echo "拦截：/dev/${disk} 包含系统核心挂载点。"
+        continue
+    fi
+
+    echo ""
+    echo "发现可操作目标磁盘: /dev/$disk"
+    execute_action "$disk"
+done
+
+# 脚本正常结束，生成 Merkle 树日志
+generate_merkle_tree_log "$LOG_FILE" "$MERKLE_LOG_FILE"
+log_message "INFO" "脚本执行完毕"
