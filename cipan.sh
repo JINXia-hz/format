@@ -148,13 +148,11 @@ format_disk() {
     
     # 再次验证是否彻底无挂载（防止因卸载失败导致硬格式化物理损坏）
     if lsblk -no MOUNTPOINT "/dev/$disk" | grep -q '/'; then
-        log_message "ERROR" "/dev/${disk} 仍有分区处于挂载状态，放弃格式化！"
+        log_message "ERROR" "/dev/${disk} 仍有分区处于挂载状态，放弃格式化"
         echo "错误：/dev/${disk} 卸载失败，出于安全考虑放弃格式化。"
         return 1
     fi
 
-
-    
     log_message "INFO" "开始擦除磁盘签名: /dev/${disk}"
     wipefs -a "/dev/$disk"
     log_message "INFO" "磁盘签名擦除完成: /dev/${disk}"
@@ -205,7 +203,6 @@ execute_action() {
 }
 
 for disk in $(lsblk -dno NAME,TYPE | awk '$2=="disk" {print $1}'); do
-    # 严格比对系统物理盘
     if [ "$disk" == "$SYS_DISK" ] ; then
         log_message "INFO" "跳过当前运行系统物理盘: /dev/${disk}"
         continue
@@ -213,7 +210,7 @@ for disk in $(lsblk -dno NAME,TYPE | awk '$2=="disk" {print $1}'); do
     
     if lsblk -no MOUNTPOINT "/dev/$disk" | grep -E -q "^/+$|^/boot"; then
         log_message "WARN" "拒绝操作：在 /dev/${disk} 上检测到关键系统挂载点！"
-        echo "拦截：/dev/${disk} 包含系统核心挂载点，已列入黑名单防误杀。"
+        echo "拦截：/dev/${disk} 包含系统核心挂载点。"
         continue
     fi
 
