@@ -74,24 +74,28 @@ fi
 log_message "INFO" "脚本启动，确认模式: ${confirm_mode}，文件系统指定方式: ${fs_mode}，统一格式: ${UNIFIED_FS:-无}"
 
 # 安全审查结束，业务开始
-ROOT_DEV=$(findmnt -n -o SOURCE /)
-SYS_DISK=$(lsblk -no PKNAME "$ROOT_DEV" | head -n1)
+ROOT_DEV=$(findmnt -n -o SOURCE / || echo "")
+if [ -z "$ROOT_DEV" ]; then
+    log_message "ERROR" "无法识别根分区路径，脚本紧急终止！"
+    echo "错误：无法获取根分区分区信息。"
+    exit 1
+fi
+
+# 获取物理根磁盘名称
+SYS_DISK=$(lsblk -no PKNAME "$ROOT_DEV" | head -n1 | xargs)
 if [ -z "$SYS_DISK" ]; then
     SYS_DISK=$(basename "$ROOT_DEV")
 fi
+# 移除末尾的分区数字或 p+数字（如 nvme0n1p2 -> nvme0n1, sda1 -> sda）
 SYS_DISK=$(echo "$SYS_DISK" | sed -E 's/p[0-9]+$//; s/[0-9]+$//')
 
-log_message "INFO" "系统盘: /dev/${SYS_DISK}"
+if [ -z "$SYS_DISK" ]; then
+    log_message "ERROR" "系统盘解析为空，脚本紧急终止！"
+    echo "核心错误：无法安全识别系统盘，为防误抹除，脚本已退出。"
+    exit 1
+fi
 
-echo "正在尝试解除所有非系统分区的挂载..."
-cat /proc/mounts | grep -E '^/dev/sd|^/dev/nvme' | grep -vE "/dev/${SYS_DISK}" | awk '{print $2}' | while IFS= read -r mount_point; do
-    log_message "INFO" "正在解除挂载: ${mount_point}"
-    if umount -l "$mount_point" 2>/dev/null; then
-        log_message "INFO" "解除挂载成功: ${mount_point}"
-    else
-        log_message "WARN" "解除挂载失败: ${mount_point}"
-    fi
-done
+log_message "INFO" "识别到当前系统盘为: /dev/${SYS_DISK}"
 
 format_disk() {
     local disk=$1
@@ -105,10 +109,9 @@ format_disk() {
         return 1
     fi
     
-    # 检查磁盘设备是否存在（排除路径穿越风险，只允许 sd/nvme/vd 等合法前缀）
-    if [[ ! "$disk" =~ ^[a-z]+[0-9]*$ ]]; then
+     if [[ ! "$disk" =~ ^[a-zA-Z0-9_-]+$ ]]; then
         log_message "ERROR" "磁盘名称格式非法: ${disk}"
-        echo "错误：磁盘名称 '${disk}' 格式非法，操作已终止。"
+        echo "错误：磁盘名称 '${disk}' 格式不合规，跳过该设备。"
         return 1
     fi
     
@@ -132,6 +135,25 @@ format_disk() {
         echo "错误：不支持的文件系统类型 '${fs_type}'"
         return 1
     fi
+    
+    echo "正在检查并解除 /dev/${disk} 及其分区的挂载状态..."
+    lsblk -no MOUNTPOINT "/dev/$disk" | grep -v '^$' | while read -r mount_point; do
+        log_message "INFO" "正在解除挂载: ${mount_point}"
+        if umount -l "$mount_point" 2>/dev/null; then
+            log_message "INFO" "解除挂载成功: ${mount_point}"
+        else
+            log_message "WARN" "解除挂载失败或无需解除: ${mount_point}"
+        fi
+    done
+    
+    # 再次验证是否彻底无挂载（防止因卸载失败导致硬格式化物理损坏）
+    if lsblk -no MOUNTPOINT "/dev/$disk" | grep -q '/'; then
+        log_message "ERROR" "/dev/${disk} 仍有分区处于挂载状态，放弃格式化！"
+        echo "错误：/dev/${disk} 卸载失败，出于安全考虑放弃格式化。"
+        return 1
+    fi
+
+
     
     log_message "INFO" "开始擦除磁盘签名: /dev/${disk}"
     wipefs -a "/dev/$disk"
@@ -183,19 +205,21 @@ execute_action() {
 }
 
 for disk in $(lsblk -dno NAME,TYPE | awk '$2=="disk" {print $1}'); do
+    # 严格比对系统物理盘
     if [ "$disk" == "$SYS_DISK" ] ; then
-        log_message "INFO" "跳过系统盘: /dev/${disk}"
+        log_message "INFO" "跳过当前运行系统物理盘: /dev/${disk}"
         continue
     fi
-    MOUNT_COUNT=$(lsblk -no MOUNTPOINT /dev/$disk | grep -c /)
-    if [ "$MOUNT_COUNT" -eq 0 ]; then
-        echo "发现需格式化磁盘: /dev/$disk"
-        log_message "INFO" "发现需格式化磁盘: /dev/${disk}"
-        execute_action "$disk"
-    else
-        echo "发现受保护磁盘: /dev/$disk ，自动跳过。"
-        log_message "INFO" "跳过受保护磁盘(有挂载点): /dev/${disk}"
+    
+    if lsblk -no MOUNTPOINT "/dev/$disk" | grep -E -q "^/+$|^/boot"; then
+        log_message "WARN" "拒绝操作：在 /dev/${disk} 上检测到关键系统挂载点！"
+        echo "拦截：/dev/${disk} 包含系统核心挂载点，已列入黑名单防误杀。"
+        continue
     fi
+
+    echo ""
+    echo "发现可操作目标磁盘: /dev/$disk"
+    execute_action "$disk"
 done
 
 log_message "INFO" "脚本执行完毕"
