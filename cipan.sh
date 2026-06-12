@@ -1,5 +1,10 @@
 #!/bin/bash
-
+if grep -q $'\r' "$0" 2>/dev/null; then
+    echo "检测到 Windows 换行符，正在自修复..."
+    sed -i 's/\r$//' "$0"
+    echo "修复完成，请重新运行脚本。"
+    exit 0
+fi
 # 加载安全保护模块（自动执行安全检查）
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 source "${SCRIPT_DIR}/security.sh"
