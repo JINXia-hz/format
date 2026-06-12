@@ -43,13 +43,9 @@ sudo ./cipan.sh
 ### 2. 正常使用
 
 ```bash
-# 交互模式（默认，每个磁盘格式化前询问确认）
 sudo ./cipan.sh
-
-# 或指定模式
-sudo ./cipan.sh 1   # 交互确认模式
-sudo ./cipan.sh 2   # 自动模式
 ```
+就是这么简单
 
 ### 3. 运行流程
 
