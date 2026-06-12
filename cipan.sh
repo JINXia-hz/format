@@ -53,6 +53,7 @@ select_type() {
         *) echo "xfs" ;;
     esac
 }
+
 # 模式选择
 echo "进入模式选择前请核对所有磁盘情况"
 lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE,MODEL
@@ -122,7 +123,7 @@ format_disk() {
         return 1
     fi
     
-     if [[ ! "$disk" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    if [[ ! "$disk" =~ ^[a-zA-Z0-9_-]+$ ]]; then
         log_message "ERROR" "磁盘名称格式非法: ${disk}"
         echo "错误：磁盘名称 '${disk}' 格式不合规，跳过该设备。"
         return 1
@@ -134,7 +135,7 @@ format_disk() {
         return 1
     fi
     
-    # 二次确认：检查该设备确实是磁盘（而非分区、loop、ram等）
+    # 二次确认：检查该设备确实是磁盘
     local device_type
     device_type=$(lsblk -dno TYPE "/dev/$disk" 2>/dev/null)
     if [ "$device_type" != "disk" ]; then
@@ -149,85 +150,41 @@ format_disk() {
         return 1
     fi
     
-    echo "正在检查并解除 /dev/${disk} 及其分区的挂载状态..."
-    # 获取该磁盘下的所有子设备（分区）
-    local parts
-    parts=$(lsblk -nlo NAME "/dev/$disk" 2>/dev/null)
-    # 第一行是磁盘本身，跳过；其余是分区
-    local part_found=false
+    echo "正在检查并解除 /dev/${disk} 及其分区的占用状态..."
+    
+    # 获取该磁盘下的所有子设备（含磁盘本身）
+    local all_devs
+    all_devs=$(lsblk -nlo NAME "/dev/$disk" 2>/dev/null)
+    
+    # 1. 强制终止进程并卸载 (由内向外：先处理分区，再处理磁盘)
+    # 使用 tac 倒序处理，确保先处理最底层的挂载点
     while IFS= read -r dev_name; do
-        if [ "$part_found" = false ]; then
-            part_found=true
-            continue
-        fi
         local mp
-        mp=$(lsblk -no MOUNTPOINT "/dev/$dev_name" 2>/dev/null)
+        mp=$(lsblk -no MOUNTPOINT "/dev/$dev_name" 2>/dev/null | grep -v "^$")
         if [ -n "$mp" ]; then
-            log_message "INFO" "正在解除挂载分区: /dev/${dev_name} (挂载点: ${mp})"
-            umount -l "/dev/$dev_name" 2>/dev/null || true
-            fuser -km "/dev/$dev_name" 2>/dev/null || true
-            umount -f "/dev/$dev_name" 2>/dev/null || true
+            log_message "INFO" "正在终止占用 /dev/${dev_name} 进程并解除挂载: ${mp}"
+            # 严格按照：杀进程 -> 正常卸载 -> 强制卸载 的顺序
+            fuser -km "$mp" 2>/dev/null || true
+            sleep 1
+            umount "$mp" 2>/dev/null || true
+            if mountpoint -q "$mp"; then
+                umount -f "$mp" 2>/dev/null || true
+            fi
         fi
-    done <<< "$parts"
+    done <<< "$(echo "$all_devs" | tac)"
     
-    # 再尝试卸载磁盘本身
-    local disk_mp
-    disk_mp=$(lsblk -no MOUNTPOINT "/dev/$disk" 2>/dev/null)
-    if [ -n "$disk_mp" ]; then
-        log_message "INFO" "正在解除挂载磁盘: /dev/${disk} (挂载点: ${disk_mp})"
-        umount -l "/dev/$disk" 2>/dev/null || true
-        fuser -km "/dev/$disk" 2>/dev/null || true
-        umount -f "/dev/$disk" 2>/dev/null || true
+    # 2. 清理 Swap/LVM/MD 占用 (在删除分区表前必须先停用这些)
+    # 关闭 Swap
+    if command -v swapon &>/dev/null; then
+        while IFS= read -r dev_name; do
+            if swapon --show 2>/dev/null | grep -q "$dev_name"; then
+                log_message "INFO" "检测到交换分区使用 /dev/${dev_name}，正在关闭..."
+                swapoff "/dev/$dev_name" 2>/dev/null || true
+            fi
+        done <<< "$all_devs"
     fi
     
-    # 等待设备释放
-    sleep 3
-    
-    # 再次验证是否彻底无挂载
-    if lsblk -no MOUNTPOINT "/dev/$disk" 2>/dev/null | grep -q '/'; then
-        log_message "ERROR" "/dev/${disk} 仍有分区处于挂载状态，放弃格式化"
-        echo "错误：/dev/${disk} 卸载失败，出于安全考虑放弃格式化。"
-        return 1
-    fi
-
-    # 检查磁盘是否有分区，如果有则尝试删除分区
-    local part_count
-    part_count=$(lsblk -nlo NAME "/dev/$disk" 2>/dev/null | wc -l)
-    if [ "$part_count" -gt 1 ]; then
-        log_message "INFO" "检测到 /dev/${disk} 存在分区，尝试删除分区..."
-        echo "检测到 /dev/${disk} 存在分区，正在删除分区..."
-        
-        # 先尝试用 wipefs -a 擦除所有签名（包括分区表）
-        if wipefs -a -f "/dev/$disk" 2>&1; then
-            log_message "INFO" "wipefs 擦除分区表成功: /dev/${disk}"
-            sleep 2
-            blockdev --rereadpt "/dev/$disk" 2>/dev/null || true
-        else
-            log_message "WARN" "wipefs 擦除分区表失败，尝试用 dd 清除磁盘头部..."
-            dd if=/dev/zero of="/dev/$disk" bs=1M count=10 status=progress 2>&1 || {
-                log_message "ERROR" "dd 清除磁盘头部也失败: /dev/${disk}"
-                echo "错误：无法清除 /dev/${disk} 的磁盘签名，设备可能仍被占用。"
-                return 1
-            }
-            sync
-            blockdev --rereadpt "/dev/$disk" 2>/dev/null || true
-            sleep 2
-        fi
-        
-        # 再次检查分区是否已被清除
-        local new_part_count
-        new_part_count=$(lsblk -nlo NAME "/dev/$disk" 2>/dev/null | wc -l)
-        if [ "$new_part_count" -gt 1 ]; then
-            log_message "ERROR" "/dev/${disk} 分区删除失败，仍有 ${new_part_count} 个分区残留"
-            echo "错误：/dev/${disk} 分区删除失败，仍有 ${new_part_count} 个分区残留。"
-            return 1
-        fi
-        echo "/dev/${disk} 分区已清除。"
-    fi
-
-    log_message "INFO" "开始擦除磁盘签名: /dev/${disk}"
-    
-    # 检查是否有 LVM/dm 设备使用该磁盘
+    # 移除 LVM
     if command -v dmsetup &>/dev/null; then
         for dm_dev in $(dmsetup ls 2>/dev/null | awk '{print $1}'); do
             if dmsetup table "$dm_dev" 2>/dev/null | grep -q "$disk"; then
@@ -236,7 +193,8 @@ format_disk() {
             fi
         done
     fi
-    # 检查是否有 mdadm 设备使用该磁盘
+    
+    # 停止 MD 阵列
     if command -v mdadm &>/dev/null; then
         for md_dev in /dev/md*; do
             if [ -b "$md_dev" ]; then
@@ -247,108 +205,31 @@ format_disk() {
             fi
         done
     fi
-    # 检查是否有交换分区使用该磁盘
-    if command -v swapon &>/dev/null; then
-        if swapon --show 2>/dev/null | grep -q "$disk"; then
-            log_message "INFO" "检测到交换分区使用 /dev/${disk}，正在关闭..."
-            swapoff "/dev/$disk" 2>/dev/null || true
-            for part in $(lsblk -nlo NAME "/dev/$disk" 2>/dev/null); do
-                swapoff "/dev/$part" 2>/dev/null || true
-            done
-        fi
-    fi
-    sleep 1
     
-    # 先尝试用 wipefs 擦除签名
-    if wipefs -a "/dev/$disk" 2>/dev/null; then
-        log_message "INFO" "wipefs 擦除签名完成: /dev/${disk}"
-    else
-        log_message "WARN" "wipefs 擦除失败，尝试用 dd 清除磁盘头部..."
-        dd if=/dev/zero of="/dev/$disk" bs=1M count=10 status=progress 2>/dev/null || {
-            log_message "ERROR" "dd 清除磁盘头部也失败: /dev/${disk}"
-            echo "错误：无法清除 /dev/${disk} 的磁盘签名，设备可能仍被占用。"
-            return 1
-        }
-        log_message "INFO" "dd 清除磁盘头部完成: /dev/${disk}"
-        sync
-        blockdev --rereadpt "/dev/$disk" 2>/dev/null || true
-        sleep 2
-        wipefs -a "/dev/$disk" 2>/dev/null || true
-    fi
-    log_message "INFO" "磁盘签名擦除完成: /dev/${disk}"
-    
-    log_message "INFO" "开始格式化磁盘(${fs_type}): /dev/${disk}"
-    echo "正在格式化为 ${fs_type} 文件系统..."
-    # 刷新内核块设备缓冲区，确保内核释放对旧文件系统的引用
-    blockdev --flushbufs "/dev/$disk" 2>/dev/null || true
-    # 通知内核重新读取分区表，清除缓存的文件系统信息
-    blockdev --rereadpt "/dev/$disk" 2>/dev/null || true
-    # 使用 udevadm 触发内核重新检测设备状态
-    if command -v udevadm &>/dev/null; then
-        udevadm settle 2>/dev/null || true
-    fi
     sleep 2
-    if $cmd "/dev/$disk" 2>&1; then
-        log_message "INFO" "格式化完成: /dev/${disk} (${fs_type})"
-        echo "/dev/$disk 格式化完成 (${fs_type})。"
-        return 0
-    else
-        log_message "ERROR" "格式化失败: /dev/${disk} (${fs_type})"
-        echo "错误：/dev/$disk 格式化失败！"
+
+    # 再次验证是否彻底无挂载
+    if lsblk -no MOUNTPOINT "/dev/$disk" 2>/dev/null | grep -q '/'; then
+        log_message "ERROR" "/dev/${disk} 仍有分区处于挂载状态，放弃格式化"
+        echo "错误：/dev/${disk} 卸载失败，出于安全考虑放弃格式化。"
         return 1
     fi
-}
 
-execute_action() {
-    local disk=$1
-    local fs_type
+    # 3. 彻底擦除文件系统签名与分区表
+    log_message "INFO" "开始擦除磁盘签名与分区表: /dev/${disk}"
+    echo "正在擦除 /dev/${disk} 的分区和签名数据..."
     
-    if [ "$fs_mode" -eq 1 ]; then
-        fs_type="$UNIFIED_FS"
+    # 先擦除所有魔数签名
+    wipefs -a -f "/dev/$disk" 2>/dev/null || true
+    
+    # 销毁分区表（优先用 sgdisk，处理 GPT 最彻底）
+    if command -v sgdisk &>/dev/null; then
+        sgdisk -Z "/dev/$disk" 2>/dev/null || true
     else
-        fs_type=$(select_type "请选择 /dev/${disk} 的文件系统类型:")
-    fi
-    
-    case "$confirm_mode" in
-        1)
-            echo "=================================================="
-            echo "$(lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE,MODEL /dev/$disk)"
-            echo "=================================================="
-            confirm=$(validate_input "确定要格式化 /dev/$disk 为 ${fs_type} 吗？(y/N)，输入 q 退出: " "^[yYnNqQ]$" "n")
-            check_quit "$confirm"
-            if [[ "$confirm" =~ ^[yY]$ ]]; then
-                log_message "INFO" "用户确认格式化磁盘: /dev/${disk}，文件系统: ${fs_type}"
-                format_disk "$disk" "$fs_type"
-            else
-                log_message "INFO" "用户取消格式化磁盘: /dev/${disk}"
-                echo "操作已取消。"
-            fi
-            ;;
-        2)
-            echo "自动格式化 /dev/$disk (${fs_type}) ..."
-            log_message "INFO" "自动模式格式化磁盘: /dev/${disk}，文件系统: ${fs_type}"
-            format_disk "$disk" "$fs_type"
-            ;;
-    esac
-}
-
-for disk in $(lsblk -dno NAME,TYPE | awk '$2=="disk" {print $1}'); do
-    if [ "$disk" == "$SYS_DISK" ] ; then
-        log_message "INFO" "跳过当前运行系统物理盘: /dev/${disk}"
-        continue
-    fi
-    
-    if lsblk -no MOUNTPOINT "/dev/$disk" | grep -E -q "^/+$|^/boot"; then
-        log_message "WARN" "拒绝操作：在 /dev/${disk} 上检测到关键系统挂载点！"
-        echo "拦截：/dev/${disk} 包含系统核心挂载点。"
-        continue
-    fi
-
-    echo ""
-    echo "发现可操作目标磁盘: /dev/$disk"
-    execute_action "$disk"
-done
-
-# 脚本正常结束，生成 Merkle 树日志
-generate_merkle_tree_log "$LOG_FILE" "$MERKLE_LOG_FILE"
-log_message "INFO" "脚本执行完毕"
+        # 没有 sgdisk 时，用 dd 擦除头部，并尝试擦除尾部(GPT备份表)
+        dd if=/dev/zero of="/dev/$disk" bs=1M count=30 status=none 2>/dev/null || true
+        local disk_size_blocks
+        disk_size_blocks=$(blockdev --getsz "/dev/$disk" 2>/dev/null || echo 0)
+        if [ "$disk_size_blocks" -gt 0 ]; then
+            # 计算倒数第 30MB 的位置
+            local seek_pos=$(( disk_size_blocks * 512
